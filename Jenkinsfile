@@ -3,13 +3,10 @@ pipeline {
 
     environment {
         AWS_REGION = 'us-east-1'
-        AWS_ACCOUNT_ID = '883155610395'
-        ECR_REGISTRY = '883155610395.dkr.ecr.us-east-1.amazonaws.com'
         ECR_REPOSITORY = 'motgarage'
-        BACKEND_IMAGE = "${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${BUILD_NUMBER}"
-        FRONTEND_IMAGE = "${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${BUILD_NUMBER}"
-        BACKEND_LATEST = "${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-latest"
-        FRONTEND_LATEST = "${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-latest"
+
+        BACKEND_LOCAL = 'garagebooking-backend'
+        FRONTEND_LOCAL = 'garagebooking-frontend'
     }
 
     stages {
@@ -21,33 +18,32 @@ pipeline {
             }
         }
 
-        stage('Check Docker') {
-            steps {
-                sh 'docker --version'
-                sh 'aws --version'
-            }
-        }
-
-        stage('ECR Login') {
+        stage('Check Tools') {
             steps {
                 sh '''
-                    aws ecr get-login-password --region $AWS_REGION |                     docker login --username AWS --password-stdin $ECR_REGISTRY
+                    docker --version
+                    aws --version
                 '''
             }
         }
 
-        stage('Create ECR Repository If Missing') {
+        stage('AWS Identity') {
             steps {
-                sh '''
-                    aws ecr describe-repositories                       --repository-names $ECR_REPOSITORY                       --region $AWS_REGION >/dev/null 2>&1 ||                     aws ecr create-repository                       --repository-name $ECR_REPOSITORY                       --region $AWS_REGION
-                '''
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'mot'
+                    ]
+                ]) {
+                    sh 'aws sts get-caller-identity'
+                }
             }
         }
 
         stage('Build Backend Image') {
             steps {
                 sh '''
-                    docker build                       -t $BACKEND_IMAGE                       -t $BACKEND_LATEST                       backend
+                    docker build                       -t $BACKEND_LOCAL:$BUILD_NUMBER                       -t $BACKEND_LOCAL:latest                       ./backend
                 '''
             }
         }
@@ -55,35 +51,87 @@ pipeline {
         stage('Build Frontend Image') {
             steps {
                 sh '''
-                    docker build                       -t $FRONTEND_IMAGE                       -t $FRONTEND_LATEST                       frontend
+                    docker build                       -t $FRONTEND_LOCAL:$BUILD_NUMBER                       -t $FRONTEND_LOCAL:latest                       ./frontend
                 '''
             }
         }
 
-        stage('Push Backend Image') {
+        stage('Login to ECR') {
+            steps {
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'mot'
+                    ]
+                ]) {
+                    sh '''
+                        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                        ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+                        aws ecr get-login-password --region $AWS_REGION |                         docker login --username AWS --password-stdin $ECR_REGISTRY
+
+                        echo "$ECR_REGISTRY" > .ecr_registry
+                    '''
+                }
+            }
+        }
+
+        stage('Ensure ECR Repository') {
+            steps {
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'mot'
+                    ]
+                ]) {
+                    sh '''
+                        aws ecr describe-repositories                           --repository-names $ECR_REPOSITORY                           --region $AWS_REGION >/dev/null 2>&1 ||                         aws ecr create-repository                           --repository-name $ECR_REPOSITORY                           --region $AWS_REGION >/dev/null
+                    '''
+                }
+            }
+        }
+
+        stage('Tag Images for ECR') {
             steps {
                 sh '''
-                    docker push $BACKEND_IMAGE
-                    docker push $BACKEND_LATEST
+                    ECR_REGISTRY=$(cat .ecr_registry)
+
+                    docker tag                       $BACKEND_LOCAL:$BUILD_NUMBER                       $ECR_REGISTRY/$ECR_REPOSITORY:backend-$BUILD_NUMBER
+
+                    docker tag                       $BACKEND_LOCAL:latest                       $ECR_REGISTRY/$ECR_REPOSITORY:backend-latest
+
+                    docker tag                       $FRONTEND_LOCAL:$BUILD_NUMBER                       $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$BUILD_NUMBER
+
+                    docker tag                       $FRONTEND_LOCAL:latest                       $ECR_REGISTRY/$ECR_REPOSITORY:frontend-latest
                 '''
             }
         }
 
-        stage('Push Frontend Image') {
+        stage('Push Images to ECR') {
             steps {
-                sh '''
-                    docker push $FRONTEND_IMAGE
-                    docker push $FRONTEND_LATEST
-                '''
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'mot'
+                    ]
+                ]) {
+                    sh '''
+                        ECR_REGISTRY=$(cat .ecr_registry)
+
+                        docker push $ECR_REGISTRY/$ECR_REPOSITORY:backend-$BUILD_NUMBER
+                        docker push $ECR_REGISTRY/$ECR_REPOSITORY:backend-latest
+
+                        docker push $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$BUILD_NUMBER
+                        docker push $ECR_REGISTRY/$ECR_REPOSITORY:frontend-latest
+                    '''
+                }
             }
         }
     }
 
     post {
         success {
-            echo 'Images pushed successfully to Amazon ECR.'
-            echo "Backend: ${BACKEND_IMAGE}"
-            echo "Frontend: ${FRONTEND_IMAGE}"
+            echo 'Garagebooking images pushed successfully to Amazon ECR.'
         }
 
         failure {
@@ -91,6 +139,7 @@ pipeline {
         }
 
         always {
+            sh 'rm -f .ecr_registry || true'
             sh 'docker image prune -f || true'
         }
     }
